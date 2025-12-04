@@ -40,6 +40,12 @@ os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
 # IST timezone
 IST = pytz.timezone('Asia/Kolkata')
 
+# Market hours (IST)
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 15
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
+
 # Interval constants for SmartAPI with their minute values
 INTERVALS = {
     "ONE_MINUTE": {"api_name": "ONE_MINUTE", "minutes": 1},
@@ -329,6 +335,8 @@ class CandleDataManager:
     def _get_last_completed_candle_time(self, now: datetime) -> datetime:
         """
         Calculate the start time of the last fully completed candle.
+        Accounts for market hours: 9:15 AM to 3:30 PM IST.
+        First candle always starts at 9:15.
         
         Args:
             now: Current datetime
@@ -336,95 +344,185 @@ class CandleDataManager:
         Returns:
             datetime of the last completed candle's start time
         """
+        market_open = now.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+        market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+        
+        # Minutes from market open (9:15 = 0)
+        market_open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE  # 555 minutes
+        market_close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE  # 930 minutes
+        
         if self.interval_minutes >= 1440:  # Daily candles
-            # Last completed daily candle is yesterday (or today if market closed)
-            last_completed = now.replace(hour=9, minute=15, second=0, microsecond=0)
-            if now.hour < 15 or (now.hour == 15 and now.minute < 30):
-                last_completed = last_completed - timedelta(days=1)
-            return last_completed
+            # Daily candle completes at market close (15:30)
+            # Last completed daily candle is today if market closed, else yesterday
+            if now >= market_close:
+                return market_open  # Today's candle is complete
+            else:
+                return market_open - timedelta(days=1)  # Yesterday's candle
         
-        elif self.interval_minutes >= 60:  # Hourly candles
-            hours = self.interval_minutes // 60
-            current_hour_block = (now.hour // hours) * hours
-            last_completed = now.replace(hour=current_hour_block, minute=0, second=0, microsecond=0)
-            # If we're at the exact boundary, go back one interval
-            if now.hour == current_hour_block and now.minute == 0 and now.second < 5:
-                last_completed = last_completed - timedelta(hours=hours)
-            return last_completed
+        # For intraday candles, calculate based on market hours
+        current_minutes = now.hour * 60 + now.minute
         
-        else:  # Minute-based candles (1, 3, 5, 10, 15, 30)
-            minutes_since_midnight = now.hour * 60 + now.minute
-            last_completed_minute = (minutes_since_midnight // self.interval_minutes) * self.interval_minutes
+        # If before market open, last completed candle was from previous trading day
+        if current_minutes < market_open_minutes:
+            # Return last candle of previous day
+            prev_day_close = market_close - timedelta(days=1)
+            return self._get_last_candle_before_close(prev_day_close - timedelta(days=1))
+        
+        # If after market close, last completed candle is the last one of today
+        if current_minutes >= market_close_minutes:
+            return self._get_last_candle_before_close(now)
+        
+        # During market hours - calculate based on interval from market open (9:15)
+        minutes_since_market_open = current_minutes - market_open_minutes
+        
+        # How many complete intervals since market open?
+        complete_intervals = minutes_since_market_open // self.interval_minutes
+        
+        # If we're exactly at an interval boundary and within first 5 seconds, go back one
+        if minutes_since_market_open % self.interval_minutes == 0 and now.second < 5:
+            complete_intervals = max(0, complete_intervals - 1)
+        
+        # Last completed candle start time
+        last_candle_minutes = market_open_minutes + (complete_intervals * self.interval_minutes)
+        last_candle_hour = last_candle_minutes // 60
+        last_candle_min = last_candle_minutes % 60
+        
+        return now.replace(hour=last_candle_hour, minute=last_candle_min, second=0, microsecond=0)
+    
+    def _get_last_candle_before_close(self, date: datetime) -> datetime:
+        """
+        Get the start time of the last candle before market close on a given date.
+        
+        Args:
+            date: The date to calculate for
             
-            last_completed_hour = last_completed_minute // 60
-            last_completed_min = last_completed_minute % 60
-            
-            last_completed = now.replace(hour=last_completed_hour, minute=last_completed_min, second=0, microsecond=0)
-            
-            # If we're at the exact boundary, go back one interval
-            if now.minute == last_completed_min and now.second < 5:
-                last_completed = last_completed - timedelta(minutes=self.interval_minutes)
-            
-            return last_completed
+        Returns:
+            datetime of the last candle's start time
+        """
+        market_open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE  # 555
+        market_close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE  # 930
+        
+        # Total trading minutes
+        trading_minutes = market_close_minutes - market_open_minutes  # 375 minutes
+        
+        # Number of complete candles in a day
+        complete_candles = trading_minutes // self.interval_minutes
+        
+        # Last candle starts at
+        last_candle_offset = (complete_candles - 1) * self.interval_minutes
+        last_candle_minutes = market_open_minutes + last_candle_offset
+        
+        last_candle_hour = last_candle_minutes // 60
+        last_candle_min = last_candle_minutes % 60
+        
+        return date.replace(hour=last_candle_hour, minute=last_candle_min, second=0, microsecond=0)
     
     def _seconds_until_next_candle(self) -> int:
         """
         Calculate seconds until the next candle completes.
+        Accounts for market hours: 9:15 AM to 3:30 PM IST.
         
         Returns:
-            Seconds to wait (including 5-second buffer)
+            Seconds to wait (including 5-second buffer), or -1 if market is closed
         """
         now = datetime.now(IST)
         
+        market_open = now.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+        market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+        
+        market_open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
+        market_close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
+        current_minutes = now.hour * 60 + now.minute
+        
         if self.interval_minutes >= 1440:  # Daily candles
             # Next candle completes at 15:30 (market close)
-            market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
             if now >= market_close:
-                market_close = market_close + timedelta(days=1)
+                # Market closed, wait until next day's market close
+                next_close = market_close + timedelta(days=1)
+                return int((next_close - now).total_seconds()) + 5
             return int((market_close - now).total_seconds()) + 5
         
-        elif self.interval_minutes >= 60:  # Hourly candles
-            hours = self.interval_minutes // 60
-            current_hour_block = (now.hour // hours) * hours
-            next_hour_block = current_hour_block + hours
-            next_candle_time = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=next_hour_block)
-            return int((next_candle_time - now).total_seconds()) + 5
+        # Before market open - wait until first candle completes
+        if current_minutes < market_open_minutes:
+            # First candle completes at 9:15 + interval
+            first_candle_end_minutes = market_open_minutes + self.interval_minutes
+            first_candle_end = now.replace(
+                hour=first_candle_end_minutes // 60,
+                minute=first_candle_end_minutes % 60,
+                second=0, microsecond=0
+            )
+            return int((first_candle_end - now).total_seconds()) + 5
         
-        else:  # Minute-based candles
-            minutes_since_midnight = now.hour * 60 + now.minute
-            current_block = (minutes_since_midnight // self.interval_minutes) * self.interval_minutes
-            next_block = current_block + self.interval_minutes
-            
-            next_hour = next_block // 60
-            next_min = next_block % 60
-            
-            next_candle_time = now.replace(hour=next_hour % 24, minute=next_min, second=0, microsecond=0)
-            if next_hour >= 24:
-                next_candle_time = next_candle_time + timedelta(days=1)
-            
-            seconds_until = int((next_candle_time - now).total_seconds())
-            return seconds_until + 5  # Add 5 second buffer
+        # After market close - wait until next day's first candle completes
+        if current_minutes >= market_close_minutes:
+            tomorrow_open = market_open + timedelta(days=1)
+            first_candle_end_minutes = market_open_minutes + self.interval_minutes
+            first_candle_end = tomorrow_open.replace(
+                hour=first_candle_end_minutes // 60,
+                minute=first_candle_end_minutes % 60,
+                second=0, microsecond=0
+            )
+            return int((first_candle_end - now).total_seconds()) + 5
+        
+        # During market hours - calculate next candle boundary from 9:15
+        minutes_since_market_open = current_minutes - market_open_minutes
+        current_candle_number = minutes_since_market_open // self.interval_minutes
+        next_candle_end_offset = (current_candle_number + 1) * self.interval_minutes
+        next_candle_end_minutes = market_open_minutes + next_candle_end_offset
+        
+        # If next candle would be after market close, return -1 (will trigger end-of-day logic)
+        if next_candle_end_minutes > market_close_minutes:
+            # Wait for market close to get the last candle
+            return int((market_close - now).total_seconds()) + 5
+        
+        next_candle_end = now.replace(
+            hour=next_candle_end_minutes // 60,
+            minute=next_candle_end_minutes % 60,
+            second=0, microsecond=0
+        )
+        
+        return int((next_candle_end - now).total_seconds()) + 5
+    
+    def _is_market_open(self) -> bool:
+        """Check if market is currently open."""
+        now = datetime.now(IST)
+        current_minutes = now.hour * 60 + now.minute
+        market_open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
+        market_close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
+        return market_open_minutes <= current_minutes < market_close_minutes
     
     def run_continuous(self):
         """
         Continuously fetch and append COMPLETED candle data for all symbols.
         Waits for each candle interval boundary to ensure candles are complete.
+        Respects market hours: 9:15 AM to 3:30 PM IST.
         """
         interval_str = f"{self.interval_minutes}min" if self.interval_minutes < 60 else (f"{self.interval_minutes // 60}h" if self.interval_minutes < 1440 else "1d")
         
         logger.info(f"Starting continuous candle fetcher for {len(self.symbols)} symbols")
         logger.info(f"Interval: {self.interval_api_name} ({interval_str})")
+        logger.info(f"Market hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} - {MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MINUTE:02d} IST")
         logger.info(f"Data folder: {DATA_FOLDER}")
         logger.info(f"Will fetch only COMPLETED {interval_str} candles")
         
         cycle_count = 0
         
         while True:
+            now = datetime.now(IST)
+            market_status = "OPEN" if self._is_market_open() else "CLOSED"
+            
             # Calculate seconds until next candle completes
             wait_seconds = self._seconds_until_next_candle()
             
             if wait_seconds > 10:  # Only wait if more than 10 seconds away
-                logger.info(f"Waiting {wait_seconds:.0f}s for next {interval_str} candle to complete...")
+                wait_mins = wait_seconds // 60
+                wait_secs = wait_seconds % 60
+                if wait_mins > 60:
+                    logger.info(f"Market {market_status}. Waiting {wait_mins // 60}h {wait_mins % 60}m for next {interval_str} candle...")
+                elif wait_mins > 0:
+                    logger.info(f"Market {market_status}. Waiting {wait_mins}m {wait_secs}s for next {interval_str} candle...")
+                else:
+                    logger.info(f"Market {market_status}. Waiting {wait_secs}s for next {interval_str} candle...")
                 time.sleep(wait_seconds)
             
             cycle_count += 1
