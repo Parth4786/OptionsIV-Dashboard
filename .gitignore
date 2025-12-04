@@ -6,3 +6,7 @@ dashboard/algoDashboard/data/memoryData/token_filtered.csv
 /winvenv
 /logs
 login.ipynb
+/.history
+/liveEngine/data
+/venv
+*.log
