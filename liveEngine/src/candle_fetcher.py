@@ -1,6 +1,7 @@
 """
-5-Minute Candle Data Fetcher for SmartAPI
-Continuously fetches and appends 5-minute candle data for specified symbols.
+Dynamic Candle Data Fetcher for SmartAPI
+Continuously fetches and appends candle data for specified symbols at any interval.
+Supports: 1, 3, 5, 10, 15, 30 minutes, 1 hour, and 1 day intervals.
 """
 
 import os
@@ -39,8 +40,29 @@ os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
 # IST timezone
 IST = pytz.timezone('Asia/Kolkata')
 
-# Interval constants for SmartAPI
+# Interval constants for SmartAPI with their minute values
 INTERVALS = {
+    "ONE_MINUTE": {"api_name": "ONE_MINUTE", "minutes": 1},
+    "THREE_MINUTE": {"api_name": "THREE_MINUTE", "minutes": 3},
+    "FIVE_MINUTE": {"api_name": "FIVE_MINUTE", "minutes": 5},
+    "TEN_MINUTE": {"api_name": "TEN_MINUTE", "minutes": 10},
+    "FIFTEEN_MINUTE": {"api_name": "FIFTEEN_MINUTE", "minutes": 15},
+    "THIRTY_MINUTE": {"api_name": "THIRTY_MINUTE", "minutes": 30},
+    "ONE_HOUR": {"api_name": "ONE_HOUR", "minutes": 60},
+    "ONE_DAY": {"api_name": "ONE_DAY", "minutes": 1440}  # 24 * 60
+}
+
+# Shorthand interval names for convenience
+INTERVAL_SHORTCUTS = {
+    "1m": "ONE_MINUTE",
+    "3m": "THREE_MINUTE", 
+    "5m": "FIVE_MINUTE",
+    "10m": "TEN_MINUTE",
+    "15m": "FIFTEEN_MINUTE",
+    "30m": "THIRTY_MINUTE",
+    "1h": "ONE_HOUR",
+    "1d": "ONE_DAY",
+    # Also accept full names
     "ONE_MINUTE": "ONE_MINUTE",
     "THREE_MINUTE": "THREE_MINUTE",
     "FIVE_MINUTE": "FIVE_MINUTE",
@@ -48,7 +70,7 @@ INTERVALS = {
     "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
     "THIRTY_MINUTE": "THIRTY_MINUTE",
     "ONE_HOUR": "ONE_HOUR",
-    "ONE_DAY": "ONE_DAY"
+    "ONE_DAY": "ONE_DAY",
 }
 
 # Default symbols to track (can be modified)
@@ -190,15 +212,25 @@ class SmartAPIClient:
 class CandleDataManager:
     """Manages continuous fetching and storage of candle data."""
     
-    def __init__(self, client: SmartAPIClient, symbols: list = None):
+    def __init__(self, client: SmartAPIClient, symbols: list = None, interval: str = "5m"):
         self.client = client
         self.symbols = symbols or DEFAULT_SYMBOLS
         self.data_cache = {}  # In-memory cache of DataFrames
         
+        # Resolve interval shortcut to full name
+        self.interval_key = INTERVAL_SHORTCUTS.get(interval.upper() if interval.upper() in INTERVAL_SHORTCUTS else interval, interval)
+        if self.interval_key not in INTERVALS:
+            raise ValueError(f"Invalid interval: {interval}. Valid options: {list(INTERVAL_SHORTCUTS.keys())}")
+        
+        self.interval_config = INTERVALS[self.interval_key]
+        self.interval_minutes = self.interval_config["minutes"]
+        self.interval_api_name = self.interval_config["api_name"]
+        
     def get_csv_path(self, symbol: str) -> str:
-        """Get CSV file path for a symbol."""
+        """Get CSV file path for a symbol with interval suffix."""
         safe_symbol = symbol.replace("-", "_").replace("&", "_")
-        return os.path.join(DATA_FOLDER, f"{safe_symbol}_5min.csv")
+        interval_suffix = f"{self.interval_minutes}min" if self.interval_minutes < 60 else (f"{self.interval_minutes // 60}h" if self.interval_minutes < 1440 else "1d")
+        return os.path.join(DATA_FOLDER, f"{safe_symbol}_{interval_suffix}.csv")
     
     def load_existing_data(self, symbol: str) -> pd.DataFrame:
         """Load existing data from CSV if available."""
@@ -223,13 +255,14 @@ class CandleDataManager:
         df.to_csv(csv_path)
         logger.info(f"Saved {len(df)} candles for {symbol} to {csv_path}")
     
-    def fetch_and_append(self, symbol_info: dict, lookback_minutes: int = 30):
+    def fetch_and_append(self, symbol_info: dict, lookback_candles: int = 5):
         """
-        Fetch latest candles and append to existing data.
+        Fetch latest COMPLETED candles and append to existing data.
+        Only fetches candles that are fully closed (not the current incomplete candle).
         
         Args:
             symbol_info: Dict with symbol, token, exchange
-            lookback_minutes: How far back to fetch (to catch any missed candles)
+            lookback_candles: How many candles back to fetch (to catch any missed candles)
         """
         symbol = symbol_info['symbol']
         token = symbol_info['token']
@@ -241,22 +274,27 @@ class CandleDataManager:
         
         existing_df = self.data_cache[symbol]
         
-        # Determine fetch window
+        # Get current time and calculate the last COMPLETED candle based on interval
         now = datetime.now(IST)
         
+        # Calculate the last completed candle time based on interval
+        last_completed_candle_time = self._get_last_completed_candle_time(now)
+        
+        to_date = last_completed_candle_time.strftime("%Y-%m-%d %H:%M")
+        
         if existing_df.empty:
-            # First fetch - get last 2 days of data
-            from_date = (now - timedelta(days=2)).strftime("%Y-%m-%d 09:15")
+            # First fetch - get last 2 days of data (or more for daily candles)
+            lookback_days = 2 if self.interval_minutes < 1440 else 30
+            from_date = (last_completed_candle_time - timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:15")
         else:
             # Get data from last candle time (with some overlap for safety)
             last_candle = existing_df.index.max()
             if last_candle.tzinfo is None:
                 last_candle = IST.localize(last_candle)
+            lookback_minutes = self.interval_minutes * lookback_candles
             from_date = (last_candle - timedelta(minutes=lookback_minutes)).strftime("%Y-%m-%d %H:%M")
         
-        to_date = now.strftime("%Y-%m-%d %H:%M")
-        
-        logger.info(f"Fetching {symbol} from {from_date} to {to_date}")
+        logger.info(f"Fetching {symbol} [{self.interval_api_name}] from {from_date} to {to_date}")
         
         # Fetch new data
         new_df = self.client.fetch_candle_data(
@@ -264,7 +302,7 @@ class CandleDataManager:
             token=token,
             from_date=from_date,
             to_date=to_date,
-            interval="FIVE_MINUTE"
+            interval=self.interval_api_name
         )
         
         if new_df.empty:
@@ -288,20 +326,107 @@ class CandleDataManager:
         
         return merged_df
     
-    def run_continuous(self, interval_seconds: int = 60):
+    def _get_last_completed_candle_time(self, now: datetime) -> datetime:
         """
-        Continuously fetch and append data for all symbols.
+        Calculate the start time of the last fully completed candle.
         
         Args:
-            interval_seconds: Seconds between fetch cycles (default 60 for 5-min candles)
+            now: Current datetime
+            
+        Returns:
+            datetime of the last completed candle's start time
         """
+        if self.interval_minutes >= 1440:  # Daily candles
+            # Last completed daily candle is yesterday (or today if market closed)
+            last_completed = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            if now.hour < 15 or (now.hour == 15 and now.minute < 30):
+                last_completed = last_completed - timedelta(days=1)
+            return last_completed
+        
+        elif self.interval_minutes >= 60:  # Hourly candles
+            hours = self.interval_minutes // 60
+            current_hour_block = (now.hour // hours) * hours
+            last_completed = now.replace(hour=current_hour_block, minute=0, second=0, microsecond=0)
+            # If we're at the exact boundary, go back one interval
+            if now.hour == current_hour_block and now.minute == 0 and now.second < 5:
+                last_completed = last_completed - timedelta(hours=hours)
+            return last_completed
+        
+        else:  # Minute-based candles (1, 3, 5, 10, 15, 30)
+            minutes_since_midnight = now.hour * 60 + now.minute
+            last_completed_minute = (minutes_since_midnight // self.interval_minutes) * self.interval_minutes
+            
+            last_completed_hour = last_completed_minute // 60
+            last_completed_min = last_completed_minute % 60
+            
+            last_completed = now.replace(hour=last_completed_hour, minute=last_completed_min, second=0, microsecond=0)
+            
+            # If we're at the exact boundary, go back one interval
+            if now.minute == last_completed_min and now.second < 5:
+                last_completed = last_completed - timedelta(minutes=self.interval_minutes)
+            
+            return last_completed
+    
+    def _seconds_until_next_candle(self) -> int:
+        """
+        Calculate seconds until the next candle completes.
+        
+        Returns:
+            Seconds to wait (including 5-second buffer)
+        """
+        now = datetime.now(IST)
+        
+        if self.interval_minutes >= 1440:  # Daily candles
+            # Next candle completes at 15:30 (market close)
+            market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+            if now >= market_close:
+                market_close = market_close + timedelta(days=1)
+            return int((market_close - now).total_seconds()) + 5
+        
+        elif self.interval_minutes >= 60:  # Hourly candles
+            hours = self.interval_minutes // 60
+            current_hour_block = (now.hour // hours) * hours
+            next_hour_block = current_hour_block + hours
+            next_candle_time = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=next_hour_block)
+            return int((next_candle_time - now).total_seconds()) + 5
+        
+        else:  # Minute-based candles
+            minutes_since_midnight = now.hour * 60 + now.minute
+            current_block = (minutes_since_midnight // self.interval_minutes) * self.interval_minutes
+            next_block = current_block + self.interval_minutes
+            
+            next_hour = next_block // 60
+            next_min = next_block % 60
+            
+            next_candle_time = now.replace(hour=next_hour % 24, minute=next_min, second=0, microsecond=0)
+            if next_hour >= 24:
+                next_candle_time = next_candle_time + timedelta(days=1)
+            
+            seconds_until = int((next_candle_time - now).total_seconds())
+            return seconds_until + 5  # Add 5 second buffer
+    
+    def run_continuous(self):
+        """
+        Continuously fetch and append COMPLETED candle data for all symbols.
+        Waits for each candle interval boundary to ensure candles are complete.
+        """
+        interval_str = f"{self.interval_minutes}min" if self.interval_minutes < 60 else (f"{self.interval_minutes // 60}h" if self.interval_minutes < 1440 else "1d")
+        
         logger.info(f"Starting continuous candle fetcher for {len(self.symbols)} symbols")
-        logger.info(f"Fetch interval: {interval_seconds} seconds")
+        logger.info(f"Interval: {self.interval_api_name} ({interval_str})")
         logger.info(f"Data folder: {DATA_FOLDER}")
+        logger.info(f"Will fetch only COMPLETED {interval_str} candles")
         
         cycle_count = 0
         
         while True:
+            # Calculate seconds until next candle completes
+            wait_seconds = self._seconds_until_next_candle()
+            
+            if wait_seconds > 10:  # Only wait if more than 10 seconds away
+                logger.info(f"Waiting {wait_seconds:.0f}s for next {interval_str} candle to complete...")
+                time.sleep(wait_seconds)
+            
             cycle_count += 1
             cycle_start = datetime.now(IST)
             logger.info(f"\n{'='*50}")
@@ -315,18 +440,36 @@ class CandleDataManager:
                     logger.error(f"Error processing {symbol_info['symbol']}: {e}")
             
             cycle_duration = (datetime.now(IST) - cycle_start).total_seconds()
-            sleep_time = max(0, interval_seconds - cycle_duration)
-            
             logger.info(f"Cycle {cycle_count} completed in {cycle_duration:.1f}s")
-            logger.info(f"Sleeping for {sleep_time:.1f}s until next cycle")
             
-            time.sleep(sleep_time)
+            # Small sleep to avoid tight loop if something goes wrong
+            time.sleep(5)
 
 
 def main():
     """Main entry point."""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Dynamic Candle Data Fetcher for SmartAPI")
+    parser.add_argument(
+        "-i", "--interval",
+        type=str,
+        default="5m",
+        help="Candle interval: 1m, 3m, 5m, 10m, 15m, 30m, 1h, 1d (default: 5m)"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch once and exit (don't run continuously)"
+    )
+    args = parser.parse_args()
+    
+    interval_str = args.interval
+    
     logger.info("=" * 60)
-    logger.info("5-Minute Candle Data Fetcher")
+    logger.info("Dynamic Candle Data Fetcher")
+    logger.info(f"Interval: {interval_str}")
     logger.info("=" * 60)
     
     # Initialize client
@@ -352,13 +495,22 @@ def main():
         {"symbol": "ICICIBANK-EQ", "token": "4963", "exchange": "NSE"},
     ]
     
-    # Initialize data manager
-    manager = CandleDataManager(client, symbols)
+    # Initialize data manager with chosen interval
+    manager = CandleDataManager(client, symbols, interval=interval_str)
     
-    # Run continuous fetcher
-    # Fetch every 60 seconds (adjust based on your needs)
-    # For 5-minute candles, fetching every 60 seconds ensures you catch each new candle
-    manager.run_continuous(interval_seconds=60)
+    if args.once:
+        # Fetch once and exit
+        logger.info("Fetching data once...")
+        for symbol_info in symbols:
+            try:
+                manager.fetch_and_append(symbol_info)
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error processing {symbol_info['symbol']}: {e}")
+        logger.info("Done!")
+    else:
+        # Run continuous fetcher
+        manager.run_continuous()
 
 
 if __name__ == "__main__":
